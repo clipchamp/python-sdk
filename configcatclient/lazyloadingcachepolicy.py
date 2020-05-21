@@ -3,7 +3,7 @@ import sys
 import datetime
 from requests import HTTPError
 
-from .readwritelock import ReadWriteLock
+from .readwritelock import RWLock
 from .interfaces import CachePolicy
 
 log = logging.getLogger(sys.modules[__name__].__name__)
@@ -17,7 +17,7 @@ class LazyLoadingCachePolicy(CachePolicy):
         self._config_fetcher = config_fetcher
         self._config_cache = config_cache
         self._cache_time_to_live = datetime.timedelta(seconds=cache_time_to_live_seconds)
-        self._lock = ReadWriteLock()
+        self._lock = RWLock()
         self._last_updated = None
 
     def get(self):
@@ -43,22 +43,29 @@ class LazyLoadingCachePolicy(CachePolicy):
 
     def force_refresh(self):
         try:
+            self._lock.acquire_write()
+            # If while waiting to acquire the write lock another
+            # thread has updated the content, then don't bother requesting
+            # to the server to minimise time.
+            if self._last_updated is not None and self._last_updated + self._cache_time_to_live >= datetime.datetime.utcnow():
+                return
             configuration_response = self._config_fetcher.get_configuration_json()
+            # set _last_updated regardless of whether the cache is updated
+            # or whether a 304 not modified has been sent back as the content
+            # we have hasn't been updated on the server so not need
+            # for subsequent requests to retry this within the cache time to live
+            self._last_updated = datetime.datetime.utcnow()
             if configuration_response.is_fetched():
                 configuration = configuration_response.json()
-                try:
-                    self._lock.acquire_write()
-
-                    self._config_cache.set(configuration)
-                    self._last_updated = datetime.datetime.utcnow()
-                finally:
-                    self._lock.release_write()
-
+                self._config_cache.set(configuration)
         except HTTPError as e:
             log.error('Double-check your SDK Key at https://app.configcat.com/sdkkey.'
                       ' Received unexpected response: %s' % str(e.response))
         except:
             log.exception(sys.exc_info()[0])
+        finally:
+            self._lock.release_write()
+
 
     def stop(self):
         pass
